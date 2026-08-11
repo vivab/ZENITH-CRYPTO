@@ -94,6 +94,18 @@ def mention_html(user_id: int, display_name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
+def profile_link(user_id: int, username: str | None, display_name: str) -> str:
+    """
+    Для /баланс: если у пользователя есть username — обычная ссылка
+    вида https://t.me/username (без тега/уведомления, просто ссылка на профиль).
+    Если username нет — t.me-ссылку так не построить, тогда как запасной
+    вариант используем кликабельное имя (тоже без уведомления пользователю).
+    """
+    if username:
+        return f"https://t.me/{username}"
+    return mention_html(user_id, display_name)
+
+
 dp = Dispatcher()
 
 # =========================
@@ -272,15 +284,13 @@ async def list_balances(message: Message):
 
     lines = ["<b>Актуальные балансы:</b>"]
     for uid, b in sorted(active.items(), key=lambda item: item[1].min_amount):
-        label = f"@{b.username}" if b.username else b.display_name
-
         parts = [f"{b.min_amount:g}-{b.max_amount:g}"]
         if b.rate_min is not None:
             parts.append(f"курс {b.rate_min:g}-{b.rate_max:g}")
         if b.note:
             parts.append(b.note)
 
-        lines.append(f"{mention_html(uid, label)} {' | '.join(parts)}")
+        lines.append(f"{profile_link(uid, b.username, b.display_name)} {' | '.join(parts)}")
 
     await message.reply("\n".join(lines))
 
