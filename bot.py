@@ -96,13 +96,14 @@ def mention_html(user_id: int, display_name: str) -> str:
 
 def profile_link(user_id: int, username: str | None, display_name: str) -> str:
     """
-    Для /баланс: если у пользователя есть username — обычная ссылка
-    вида https://t.me/username (без тега/уведомления, просто ссылка на профиль).
+    Для /баланс: если у пользователя есть username — гиперссылка вида
+    Yebokpp (без "@"), спрятанная за адресом https://t.me/username
+    (просто ссылка на профиль, без тега/уведомления пользователю).
     Если username нет — t.me-ссылку так не построить, тогда как запасной
     вариант используем кликабельное имя (тоже без уведомления пользователю).
     """
     if username:
-        return f"https://t.me/{username}"
+        return f'<a href="https://t.me/{username}">{username}</a>'
     return mention_html(user_id, display_name)
 
 
