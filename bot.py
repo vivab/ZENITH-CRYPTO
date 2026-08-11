@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import LinkPreviewOptions, Message
 
 # =========================
 #         НАСТРОЙКИ
@@ -95,13 +95,6 @@ def mention_html(user_id: int, display_name: str) -> str:
 
 
 def profile_link(user_id: int, username: str | None, display_name: str) -> str:
-    """
-    Для /баланс: если у пользователя есть username — гиперссылка вида
-    Yebokpp (без "@"), спрятанная за адресом https://t.me/username
-    (просто ссылка на профиль, без тега/уведомления пользователю).
-    Если username нет — t.me-ссылку так не построить, тогда как запасной
-    вариант используем кликабельное имя (тоже без уведомления пользователю).
-    """
     if username:
         return f'<a href="https://t.me/{username}">{username}</a>'
     return mention_html(user_id, display_name)
@@ -293,15 +286,16 @@ async def list_balances(message: Message):
 
         lines.append(f"{profile_link(uid, b.username, b.display_name)} {' | '.join(parts)}")
 
-    await message.reply("\n".join(lines))
+    await message.reply(
+        "\n".join(lines),
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
+    )
 
 
 @dp.message(F.text.regexp(ORDER_RE.pattern))
 async def handle_order(message: Message):
     text = message.text.strip()
 
-    # игнорируем сами команды бота — некоторые из них (например "+курс 75-85")
-    # тоже подходят под шаблон "число-число" и иначе будут приняты за ордер
     if (
         SET_BALANCE_RE.match(text)
         or REMOVE_BALANCE_RE.match(text)
@@ -336,7 +330,6 @@ async def handle_order(message: Message):
                 continue
             if not (bal.min_amount <= amount <= bal.max_amount):
                 continue
-            # если пользователь задал курс — ордер должен попадать и в этот диапазон тоже
             if bal.rate_min is not None and not (bal.rate_min <= rate <= bal.rate_max):
                 continue
             matched_users[uid] = bal
