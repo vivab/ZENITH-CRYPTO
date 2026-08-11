@@ -149,7 +149,7 @@ async def set_balance(message: Message):
     )
 
     await message.reply(
-        f"Баланс установлен ✅ ({low:g}-{high:g})\nАвтоудаление через 1 час."
+        f"Баланс установлен✅ {low:g}-{high:g}₽\nБаланс будет актуален 1 час"
     )
 
 
@@ -278,7 +278,7 @@ async def list_balances(message: Message):
 
     lines = ["<b>Актуальные балансы:</b>"]
     for uid, b in sorted(active.items(), key=lambda item: item[1].min_amount):
-        parts = [f"{b.min_amount:g}-{b.max_amount:g}"]
+        parts = [f"{b.min_amount:g}-{b.max_amount:g}₽"]
         if b.rate_min is not None:
             parts.append(f"курс {b.rate_min:g}-{b.rate_max:g}")
         if b.note:
