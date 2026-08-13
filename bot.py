@@ -3,8 +3,10 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -17,356 +19,450 @@ from aiogram.types import LinkPreviewOptions, Message
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER")
 
-BALANCE_TTL_SECONDS = 60 * 60      # через сколько сгорает баланс (1 час)
-CLEANUP_INTERVAL_SECONDS = 60      # как часто чистим протухшие балансы
-EXCLUDE_ORDER_AUTHOR = True        # не тегать автора ордера, даже если его диапазон подходит
+ORDER_TTL_SECONDS = 30 * 60        # ордер актуален 30 минут
+CLEANUP_INTERVAL_SECONDS = 60      # как часто чистим протухшие ордера
+MAX_CHECK_SNAPSHOTS_PER_CHAT = 50  # сколько последних /check помним (для /take)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("balance_bot")
+logger = logging.getLogger("order_bot")
+
+# Ключевые слова, по которым определяем тип ордера.
+# Порядок появления в тексте решает, если вдруг встретились слова из обеих групп.
+BUY_KEYWORDS = ["хавну", "возьму", "нужны", "нужен", "нужна", "дайте", "продайте", "куплю"]
+SELL_KEYWORDS = ["продам", "дам", "отдам"]
+
+BUY_EMOJI_FALLBACK = "🟩"
+SELL_EMOJI_FALLBACK = "🟥"
+
+# Кастомные премиум-эмодзи (id получены через debug-хендлер, см. ниже в файле)
+BUY_CUSTOM_EMOJI_ID = "5296596700704548349"
+SELL_CUSTOM_EMOJI_ID = "5294049355601292129"
+
+
+def custom_emoji_html(emoji_id: str, fallback: str) -> str:
+    """
+    <tg-emoji> — официальный способ вставить кастомный (в т.ч. премиум) эмодзи
+    в текст сообщения при parse_mode=HTML. fallback показывается там,
+    где кастомные эмодзи не поддерживаются (старые клиенты и т.п.)
+    """
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+BUY_EMOJI = custom_emoji_html(BUY_CUSTOM_EMOJI_ID, BUY_EMOJI_FALLBACK)
+SELL_EMOJI = custom_emoji_html(SELL_CUSTOM_EMOJI_ID, SELL_EMOJI_FALLBACK)
+
+# =========================
+#      КУРСЫ ВАЛЮТ (/course)
+# =========================
+
+# (id в CoinGecko, как показываем в сообщении)
+# Можно добавить/убрать монеты — id берутся с coingecko.com (в адресной строке монеты)
+COURSE_ASSETS = [
+    ("tether", "$"),
+    ("the-open-network", "TON (Gram)"),
+]
+
+COURSE_CACHE_TTL_SECONDS = 60  # чтобы не долбить CoinGecko при частых /course
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+http_session: aiohttp.ClientSession | None = None
+_course_cache: dict = {"data": None, "fetched_at": 0.0}
+
+HOURLY_COURSE_INTERVAL_SECONDS = 60 * 60
+known_chats: set[int] = set()
+
+
+def format_rub(value: float) -> str:
+    if value >= 1000:
+        return f"{value:,.0f}".replace(",", " ")
+    if value >= 1:
+        return f"{value:,.2f}".replace(",", " ")
+    return f"{value:.4f}"
+
+
+async def fetch_rates() -> dict | None:
+    now = time.time()
+    if _course_cache["data"] is not None and now - _course_cache["fetched_at"] < COURSE_CACHE_TTL_SECONDS:
+        return _course_cache["data"]
+
+    ids = ",".join(asset_id for asset_id, _ in COURSE_ASSETS)
+    params = {"ids": ids, "vs_currencies": "rub"}
+
+    try:
+        async with http_session.get(
+            COINGECKO_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"CoinGecko вернул статус {resp.status}")
+                return None
+            data = await resp.json()
+    except Exception as e:
+        logger.warning(f"Не удалось получить курс: {e}")
+        return None
+
+    _course_cache["data"] = data
+    _course_cache["fetched_at"] = now
+    return data
+
 
 # =========================
 #        ХРАНИЛИЩЕ
 # =========================
 
-
 @dataclass
-class UserBalance:
+class Order:
+    order_id: int
     user_id: int
     display_name: str
     username: str | None
-    min_amount: float
-    max_amount: float
+    raw_text: str
+    order_type: str  # "buy" или "sell"
+    created_at: float
     expire_at: float
-    rate_min: float | None = None
-    rate_max: float | None = None
-    note: str | None = None
 
 
-# chat_id -> {user_id: UserBalance}
-balances: dict[int, dict[int, UserBalance]] = {}
+# chat_id -> {order_id: Order}
+orders: dict[int, dict[int, Order]] = {}
+
+# chat_id -> следующий свободный order_id
+order_counters: dict[int, int] = {}
+
+# chat_id -> {user_id: order_id}  (у каждого юзера максимум один активный ордер)
+user_current_order: dict[int, dict[int, int]] = {}
+
+# chat_id -> OrderedDict[check_message_id: [order_id, order_id, ...]]
+# нужен, чтобы /take N понимал, на какой именно /check отвечает пользователь
+check_snapshots: dict[int, "OrderedDict[int, list[int]]"] = {}
+
 
 # =========================
 #        РЕГУЛЯРКИ
 # =========================
 
-# +баланс 500-1000  /  +баланс 500,5-1000
-SET_BALANCE_RE = re.compile(
-    r'^\+\s*баланс\s+(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)\s*$',
-    re.IGNORECASE,
-)
-
-# -баланс
-REMOVE_BALANCE_RE = re.compile(r'^-\s*баланс\s*$', re.IGNORECASE)
-
-# +курс 75-85
-SET_RATE_RE = re.compile(
-    r'^\+\s*курс\s+(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)\s*$',
-    re.IGNORECASE,
-)
-
-# -курс
-REMOVE_RATE_RE = re.compile(r'^-\s*курс\s*$', re.IGNORECASE)
-
-# .Обновить
-REFRESH_RE = re.compile(r'^\.\s*обновить\s*$', re.IGNORECASE)
-
-# +Примечание Сбп Куар Грев (1-5 слов)
-SET_NOTE_RE = re.compile(r'^\+\s*примечание\s+(.+)$', re.IGNORECASE)
-
-# -Примечание
-REMOVE_NOTE_RE = re.compile(r'^-\s*примечание\s*$', re.IGNORECASE)
-
-MAX_NOTE_WORDS = 5
-
-# 500/75, 500-75, 738.5/73, 7300/73,5, 500/75 сбп, 500-75 Куар и т.д.
-# Разделитель может быть "/" или "-", после числа может идти любой текст (сбп, грев, карта...)
-ORDER_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*[/\-]\s*(\d+(?:[.,]\d+)?)')
+SET_ORDER_RE = re.compile(r'^/set(@\w+)?\s+(.+)$', re.IGNORECASE | re.DOTALL)
+REMOVE_ORDER_RE = re.compile(r'^/-set(@\w+)?\s*$', re.IGNORECASE)
+UP_RE = re.compile(r'^\.\s*up\s*$', re.IGNORECASE)
+CHECK_RE = re.compile(r'^/check(@\w+)?\s*$', re.IGNORECASE)
+TAKE_RE = re.compile(r'^/take(@\w+)?\s+(\d+)\s*$', re.IGNORECASE)
+COURSE_RE = re.compile(r'^/course(@\w+)?\s*$', re.IGNORECASE)
 
 
-def parse_number(raw: str) -> float:
-    return float(raw.replace(',', '.'))
+def detect_order_type(text: str) -> str | None:
+    """Возвращает 'buy' / 'sell' по самому раннему ключевому слову в тексте, либо None."""
+    candidates: list[tuple[int, str]] = []
+
+    for kw in BUY_KEYWORDS:
+        m = re.search(r'\b' + re.escape(kw) + r'\w*', text, re.IGNORECASE)
+        if m:
+            candidates.append((m.start(), "buy"))
+
+    for kw in SELL_KEYWORDS:
+        m = re.search(r'\b' + re.escape(kw) + r'\w*', text, re.IGNORECASE)
+        if m:
+            candidates.append((m.start(), "sell"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def escape_html(text: str) -> str:
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
 def mention_html(user_id: int, display_name: str) -> str:
-    safe_name = (
-        display_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    )
-    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+    return f'<a href="tg://user?id={user_id}">{escape_html(display_name)}</a>'
 
 
-def profile_link(user_id: int, username: str | None, display_name: str) -> str:
+def user_label(user_id: int, username: str | None, display_name: str) -> str:
     if username:
-        return f'<a href="https://t.me/{username}">{username}</a>'
-    return mention_html(user_id, display_name)
+        safe_username = escape_html(username)
+        return f'<a href="https://t.me/{safe_username}">@{safe_username}</a>'
+    return escape_html(display_name)
 
 
 dp = Dispatcher()
+
+
+@dp.message.outer_middleware()
+async def track_known_chats(handler, event: Message, data):
+    # запоминаем каждый чат, где бот увидел хоть одно сообщение —
+    # сюда потом будем присылать почасовой курс
+    if event.chat.type in ("group", "supergroup"):
+        known_chats.add(event.chat.id)
+    return await handler(event, data)
+
 
 # =========================
 #         ХЕНДЛЕРЫ
 # =========================
 
-
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я слежу за ордерами в чате.\n\n"
-        "➕ <code>+баланс 500-1000</code> — задать диапазон суммы. "
-        "Как только придёт подходящий ордер (например 600/79) — я тебя тегну.\n"
-        "➖ <code>-баланс</code> — удалить диапазон суммы.\n\n"
-        "➕ <code>+курс 75-85</code> — задать диапазон курса (ордер должен попадать и в сумму, и в курс).\n"
-        "➖ <code>-курс</code> — удалить диапазон курса.\n\n"
-        "➕ <code>+примечание Сбп Куар Грев</code> — до 5 слов пометки (необязательно).\n"
-        "➖ <code>-примечание</code> — удалить примечание.\n\n"
-        "🔄 <code>.Обновить</code> — сбросить таймер автоудаления ещё на 1 час.\n\n"
-        "📋 <code>/баланс</code> — список всех активных балансов в чате.\n\n"
-        "Баланс (и всё, что к нему привязано) автоматически удаляется через 1 час "
-        "после установки, если не обновить его через <code>.Обновить</code>."
+        "Привет! Я доска ордеров для чата.\n\n"
+        "➕ <code>/set Куплю баксы на 700₽</code> — добавить ордер (актуален 30 минут).\n"
+        "🔄 <code>.up</code> — продлить свой ордер ещё на 30 минут.\n"
+        "➖ <code>/-set</code> — удалить свой ордер.\n\n"
+        "📋 <code>/check</code> — список всех актуальных ордеров.\n"
+        "🤝 В ответ на сообщение со списком: <code>/take 1</code> — взять ордер под номером 1.\n\n"
+        "💱 <code>/course</code> — актуальный курс доллара и нескольких криптовалют к рублю.\n\n"
+        "У каждого может быть только один активный ордер одновременно — "
+        "новый <code>/set</code> заменяет предыдущий."
     )
 
 
-@dp.message(F.text.regexp(SET_BALANCE_RE.pattern, flags=re.IGNORECASE))
-async def set_balance(message: Message):
-    match = SET_BALANCE_RE.match(message.text.strip())
+@dp.message(F.text.regexp(SET_ORDER_RE.pattern, flags=re.IGNORECASE | re.DOTALL))
+async def set_order(message: Message):
+    match = SET_ORDER_RE.match(message.text.strip())
     if not match:
         return
 
-    low_raw, high_raw = match.groups()
-    low, high = parse_number(low_raw), parse_number(high_raw)
-    if low > high:
-        low, high = high, low
+    raw_text = match.group(2).strip()
+    order_type = detect_order_type(raw_text)
+
+    if order_type is None:
+        await message.reply(
+            "Не понял, покупка это или продажа 🤔\n"
+            "Добавь в текст одно из слов:\n"
+            f"Покупка: {', '.join(BUY_KEYWORDS)}\n"
+            f"Продажа: {', '.join(SELL_KEYWORDS)}"
+        )
+        return
 
     chat_id = message.chat.id
     user = message.from_user
+    now = time.time()
 
-    balances.setdefault(chat_id, {})[user.id] = UserBalance(
+    # убираем предыдущий активный ордер этого же пользователя, если был
+    existing_id = user_current_order.get(chat_id, {}).get(user.id)
+    if existing_id is not None:
+        orders.get(chat_id, {}).pop(existing_id, None)
+
+    order_id = order_counters.get(chat_id, 1)
+    order_counters[chat_id] = order_id + 1
+
+    orders.setdefault(chat_id, {})[order_id] = Order(
+        order_id=order_id,
         user_id=user.id,
         display_name=user.full_name,
         username=user.username,
-        min_amount=low,
-        max_amount=high,
-        expire_at=time.time() + BALANCE_TTL_SECONDS,
+        raw_text=raw_text,
+        order_type=order_type,
+        created_at=now,
+        expire_at=now + ORDER_TTL_SECONDS,
     )
+    user_current_order.setdefault(chat_id, {})[user.id] = order_id
 
+    emoji = BUY_EMOJI if order_type == "buy" else SELL_EMOJI
+    label = "Покупка" if order_type == "buy" else "Продажа"
     await message.reply(
-        f"Баланс установлен✅ {low:g}-{high:g}₽\nБаланс будет актуален 1 час"
+        f"Ордер добавлен ✅ {emoji} {label}\nАктуален 30 минут. Продлить: <code>.up</code>"
     )
 
 
-@dp.message(F.text.regexp(REMOVE_BALANCE_RE.pattern, flags=re.IGNORECASE))
-async def remove_balance(message: Message):
+@dp.message(F.text.regexp(REMOVE_ORDER_RE.pattern, flags=re.IGNORECASE))
+async def remove_order(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    chat_balances = balances.get(chat_id, {})
 
-    if chat_balances.pop(user_id, None) is not None:
-        await message.reply("Баланс удалён ❌")
+    order_id = user_current_order.get(chat_id, {}).pop(user_id, None)
+    if order_id is not None:
+        orders.get(chat_id, {}).pop(order_id, None)
+        await message.reply("Ордер удалён ❌")
     else:
-        await message.reply("У тебя не было установленного баланса.")
+        await message.reply("У тебя нет активного ордера.")
 
 
-def get_active_balance(chat_id: int, user_id: int) -> UserBalance | None:
-    chat_balances = balances.get(chat_id, {})
-    bal = chat_balances.get(user_id)
-    if bal is None or bal.expire_at <= time.time():
-        return None
-    return bal
-
-
-NO_BALANCE_HINT = "Сначала задай диапазон суммы: <code>+баланс 500-1000</code>"
-
-
-@dp.message(F.text.regexp(SET_RATE_RE.pattern, flags=re.IGNORECASE))
-async def set_rate(message: Message):
-    match = SET_RATE_RE.match(message.text.strip())
-    if not match:
-        return
-
+@dp.message(F.text.regexp(UP_RE.pattern, flags=re.IGNORECASE))
+async def extend_order(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    bal = get_active_balance(chat_id, user_id)
-    if bal is None:
-        await message.reply(NO_BALANCE_HINT)
+
+    order_id = user_current_order.get(chat_id, {}).get(user_id)
+    order = orders.get(chat_id, {}).get(order_id) if order_id is not None else None
+
+    if order is None or order.expire_at <= time.time():
+        await message.reply("У тебя нет активного ордера для продления.")
         return
 
-    low_raw, high_raw = match.groups()
-    low, high = parse_number(low_raw), parse_number(high_raw)
-    if low > high:
-        low, high = high, low
-
-    bal.rate_min, bal.rate_max = low, high
-    await message.reply(f"Курс установлен ✅ ({low:g}-{high:g})")
+    order.expire_at = time.time() + ORDER_TTL_SECONDS
+    await message.reply("Ордер продлён ✅ ещё на 30 минут.")
 
 
-@dp.message(F.text.regexp(REMOVE_RATE_RE.pattern, flags=re.IGNORECASE))
-async def remove_rate(message: Message):
+@dp.message(F.text.regexp(CHECK_RE.pattern, flags=re.IGNORECASE))
+async def check_orders(message: Message):
     chat_id = message.chat.id
-    user_id = message.from_user.id
-    bal = get_active_balance(chat_id, user_id)
-
-    if bal is None or bal.rate_min is None:
-        await message.reply("У тебя не было установленного курса.")
-        return
-
-    bal.rate_min, bal.rate_max = None, None
-    await message.reply("Курс удалён ❌")
-
-
-@dp.message(F.text.regexp(SET_NOTE_RE.pattern, flags=re.IGNORECASE))
-async def set_note(message: Message):
-    match = SET_NOTE_RE.match(message.text.strip())
-    if not match:
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    bal = get_active_balance(chat_id, user_id)
-    if bal is None:
-        await message.reply(NO_BALANCE_HINT)
-        return
-
-    raw_note = match.group(1).strip()
-    words = raw_note.split()
-    if len(words) > MAX_NOTE_WORDS:
-        await message.reply(f"Примечание слишком длинное, максимум {MAX_NOTE_WORDS} слов.")
-        return
-
-    note = ", ".join(words)
-    bal.note = note
-    await message.reply(f"Примечание установлено ✅ ({note})")
-
-
-@dp.message(F.text.regexp(REMOVE_NOTE_RE.pattern, flags=re.IGNORECASE))
-async def remove_note(message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    bal = get_active_balance(chat_id, user_id)
-
-    if bal is None or bal.note is None:
-        await message.reply("У тебя не было установленного примечания.")
-        return
-
-    bal.note = None
-    await message.reply("Примечание удалено ❌")
-
-
-@dp.message(F.text.regexp(REFRESH_RE.pattern, flags=re.IGNORECASE))
-async def refresh_balance(message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    bal = get_active_balance(chat_id, user_id)
-
-    if bal is None:
-        await message.reply(NO_BALANCE_HINT)
-        return
-
-    bal.expire_at = time.time() + BALANCE_TTL_SECONDS
-    await message.reply("Таймер обновлён ✅ Ещё 1 час.")
-
-
-@dp.message(F.text.regexp(r'^/баланс(@\w+)?\s*$', flags=re.IGNORECASE))
-async def list_balances(message: Message):
-    chat_id = message.chat.id
-    chat_balances = balances.get(chat_id, {})
     now = time.time()
 
-    active = {uid: b for uid, b in chat_balances.items() if b.expire_at > now}
+    chat_orders = orders.get(chat_id, {})
+    active = [o for o in chat_orders.values() if o.expire_at > now]
 
     if not active:
-        await message.reply("Активных балансов нет.")
+        await message.reply("Активных ордеров нет.")
         return
 
-    lines = ["<b>Актуальные балансы:</b>"]
-    for uid, b in sorted(active.items(), key=lambda item: item[1].min_amount):
-        parts = [f"{b.min_amount:g}-{b.max_amount:g}₽"]
-        if b.rate_min is not None:
-            parts.append(f"курс {b.rate_min:g}-{b.rate_max:g}")
-        if b.note:
-            parts.append(b.note)
+    active.sort(key=lambda o: o.created_at)
 
-        lines.append(f"{profile_link(uid, b.username, b.display_name)} {' | '.join(parts)}")
+    lines = [
+        "<b>Актуальные ордера тут!</b>",
+        f"{BUY_EMOJI} - Покупка",
+        f"{SELL_EMOJI} - Продажа",
+        "",
+    ]
 
-    await message.reply(
+    snapshot_ids: list[int] = []
+    for i, order in enumerate(active, start=1):
+        emoji = BUY_EMOJI if order.order_type == "buy" else SELL_EMOJI
+        label = user_label(order.user_id, order.username, order.display_name)
+        if i > 1:
+            lines.append("")  # пустая строка-отступ между ордерами
+        lines.append(f"{i}. {emoji} {label} - {escape_html(order.raw_text)}")
+        snapshot_ids.append(order.order_id)
+
+    sent = await message.answer(
         "\n".join(lines),
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
+    chat_snapshots = check_snapshots.setdefault(chat_id, OrderedDict())
+    chat_snapshots[sent.message_id] = snapshot_ids
+    if len(chat_snapshots) > MAX_CHECK_SNAPSHOTS_PER_CHAT:
+        chat_snapshots.popitem(last=False)
 
-@dp.message(F.text.regexp(ORDER_RE.pattern))
-async def handle_order(message: Message):
-    text = message.text.strip()
 
-    if (
-        SET_BALANCE_RE.match(text)
-        or REMOVE_BALANCE_RE.match(text)
-        or SET_RATE_RE.match(text)
-        or REMOVE_RATE_RE.match(text)
-        or REFRESH_RE.match(text)
-        or SET_NOTE_RE.match(text)
-        or REMOVE_NOTE_RE.match(text)
-    ):
+@dp.message(F.text.regexp(TAKE_RE.pattern, flags=re.IGNORECASE))
+async def take_order(message: Message):
+    match = TAKE_RE.match(message.text.strip())
+    if not match:
+        return
+
+    if message.reply_to_message is None:
+        await message.reply(
+            "Команду /take нужно отправлять в ответ на сообщение со списком ордеров (/check)."
+        )
         return
 
     chat_id = message.chat.id
-    chat_balances = balances.get(chat_id)
-    if not chat_balances:
+    reply_to_id = message.reply_to_message.message_id
+    snapshot = check_snapshots.get(chat_id, {}).get(reply_to_id)
+
+    if snapshot is None:
+        await message.reply(
+            "Это не то сообщение со списком ордеров, или список устарел. "
+            "Сделай новый /check и отвечай /take уже на него."
+        )
         return
 
-    now = time.time()
-    matches = ORDER_RE.findall(text)
-    if not matches:
+    number = int(match.group(2))
+    if number < 1 or number > len(snapshot):
+        await message.reply(f"Нет ордера под номером {number} в этом списке.")
         return
 
-    author_id = message.from_user.id if message.from_user else None
-    matched_users: dict[int, UserBalance] = {}
+    order_id = snapshot[number - 1]
+    order = orders.get(chat_id, {}).get(order_id)
 
-    for amount_raw, rate_raw in matches:
-        amount = parse_number(amount_raw)
-        rate = parse_number(rate_raw)
-        for uid, bal in list(chat_balances.items()):
-            if bal.expire_at <= now:
-                continue
-            if EXCLUDE_ORDER_AUTHOR and uid == author_id:
-                continue
-            if not (bal.min_amount <= amount <= bal.max_amount):
-                continue
-            if bal.rate_min is not None and not (bal.rate_min <= rate <= bal.rate_max):
-                continue
-            matched_users[uid] = bal
-
-    if not matched_users:
+    if order is None or order.expire_at <= time.time():
+        await message.reply("Этот ордер уже неактуален (взят или истёк).")
         return
 
-    mentions = " ".join(
-        mention_html(uid, bal.display_name) for uid, bal in matched_users.items()
+    taker = message.from_user
+    if taker.id == order.user_id:
+        await message.reply("Нельзя взять свой же ордер 🙂")
+        return
+
+    # удаляем ордер из списка сразу, чтобы его не взяли повторно
+    orders.get(chat_id, {}).pop(order_id, None)
+    if user_current_order.get(chat_id, {}).get(order.user_id) == order_id:
+        del user_current_order[chat_id][order.user_id]
+
+    creator_mention = user_label(order.user_id, order.username, order.display_name)
+    taker_mention = user_label(taker.id, taker.username, taker.full_name)
+
+    await message.reply(
+        f"{creator_mention} ваш ордер взял {taker_mention}\n"
+        "Внимание, проводите сделку через проверенных гарантов чата!\n"
+        "Будьте аккуратнее и удачи вам!"
     )
-    await message.reply(mentions)
+
+
+def build_course_lines(data: dict) -> list[str] | None:
+    lines = ["<b>Актуальный курс:</b>"]
+    for asset_id, label in COURSE_ASSETS:
+        entry = data.get(asset_id)
+        if not entry or "rub" not in entry:
+            continue
+        lines.append(f"1 {label} = {format_rub(entry['rub'])}₽")
+
+    if len(lines) == 1:
+        return None
+
+    return lines
+
+
+@dp.message(F.text.regexp(COURSE_RE.pattern, flags=re.IGNORECASE))
+async def show_course(message: Message):
+    data = await fetch_rates()
+    if not data:
+        await message.reply("Не получилось получить курс, попробуй чуть позже.")
+        return
+
+    lines = build_course_lines(data)
+    if lines is None:
+        await message.reply("Не получилось получить курс, попробуй чуть позже.")
+        return
+
+    await message.reply("\n".join(lines))
 
 
 # =========================
 #      ФОНОВАЯ ОЧИСТКА
 # =========================
 
-
 async def cleanup_task():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
         now = time.time()
-        for chat_id, chat_balances in list(balances.items()):
-            for uid, bal in list(chat_balances.items()):
-                if bal.expire_at <= now:
-                    del chat_balances[uid]
-                    logger.info(f"Баланс пользователя {uid} в чате {chat_id} истёк")
-            if not chat_balances:
-                del balances[chat_id]
+
+        for chat_id, chat_orders in list(orders.items()):
+            for order_id, order in list(chat_orders.items()):
+                if order.expire_at <= now:
+                    del chat_orders[order_id]
+                    current = user_current_order.get(chat_id, {})
+                    if current.get(order.user_id) == order_id:
+                        del current[order.user_id]
+                    logger.info(f"Ордер {order_id} в чате {chat_id} истёк")
+            if not chat_orders:
+                del orders[chat_id]
+
+
+async def hourly_course_task(bot: Bot):
+    while True:
+        await asyncio.sleep(HOURLY_COURSE_INTERVAL_SECONDS)
+
+        data = await fetch_rates()
+        lines = build_course_lines(data) if data else None
+        if lines is None:
+            logger.warning("Почасовой курс: не удалось получить данные, пропускаю рассылку")
+            continue
+
+        text = "\n".join(lines)
+        for chat_id in list(known_chats):
+            try:
+                await bot.send_message(chat_id, text)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить курс в чат {chat_id}: {e}")
 
 
 # =========================
 #           MAIN
 # =========================
 
-
 async def main():
+    global http_session
+
     if BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER":
         raise RuntimeError(
             "Укажи токен бота: через переменную окружения BOT_TOKEN "
@@ -374,10 +470,15 @@ async def main():
         )
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    http_session = aiohttp.ClientSession()
     asyncio.create_task(cleanup_task())
+    asyncio.create_task(hourly_course_task(bot))
 
     logger.info("Бот запущен, слушаю сообщения...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await http_session.close()
 
 
 if __name__ == "__main__":
