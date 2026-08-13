@@ -71,6 +71,9 @@ _course_cache: dict = {"data": None, "fetched_at": 0.0}
 HOURLY_COURSE_INTERVAL_SECONDS = 60 * 60
 known_chats: set[int] = set()
 
+# Глобально отключаем предпросмотр ссылок
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
 
 def format_rub(value: float) -> str:
     if value >= 1000:
@@ -210,7 +213,8 @@ async def cmd_start(message: Message):
         "🤝 В ответ на сообщение со списком: <code>/take 1</code> — взять ордер под номером 1.\n\n"
         "💱 <code>/course</code> — актуальный курс доллара и нескольких криптовалют к рублю.\n\n"
         "У каждого может быть только один активный ордер одновременно — "
-        "новый <code>/set</code> заменяет предыдущий."
+        "новый <code>/set</code> заменяет предыдущий.",
+        link_preview_options=NO_PREVIEW
     )
 
 
@@ -228,7 +232,8 @@ async def set_order(message: Message):
             "Не понял, покупка это или продажа 🤔\n"
             "Добавь в текст одно из слов:\n"
             f"Покупка: {', '.join(BUY_KEYWORDS)}\n"
-            f"Продажа: {', '.join(SELL_KEYWORDS)}"
+            f"Продажа: {', '.join(SELL_KEYWORDS)}",
+            link_preview_options=NO_PREVIEW
         )
         return
 
@@ -259,7 +264,8 @@ async def set_order(message: Message):
     emoji = BUY_EMOJI if order_type == "buy" else SELL_EMOJI
     label = "Покупка" if order_type == "buy" else "Продажа"
     await message.reply(
-        f"Ордер добавлен ✅ {emoji} {label}\nАктуален 30 минут. Продлить: <code>.up</code>"
+        f"Ордер добавлен ✅ {emoji} {label}\nАктуален 30 минут. Продлить: <code>.up</code>",
+        link_preview_options=NO_PREVIEW
     )
 
 
@@ -271,9 +277,9 @@ async def remove_order(message: Message):
     order_id = user_current_order.get(chat_id, {}).pop(user_id, None)
     if order_id is not None:
         orders.get(chat_id, {}).pop(order_id, None)
-        await message.reply("Ордер удалён ❌")
+        await message.reply("Ордер удалён ❌", link_preview_options=NO_PREVIEW)
     else:
-        await message.reply("У тебя нет активного ордера.")
+        await message.reply("У тебя нет активного ордера.", link_preview_options=NO_PREVIEW)
 
 
 @dp.message(F.text.regexp(UP_RE.pattern, flags=re.IGNORECASE))
@@ -285,11 +291,11 @@ async def extend_order(message: Message):
     order = orders.get(chat_id, {}).get(order_id) if order_id is not None else None
 
     if order is None or order.expire_at <= time.time():
-        await message.reply("У тебя нет активного ордера для продления.")
+        await message.reply("У тебя нет активного ордера для продления.", link_preview_options=NO_PREVIEW)
         return
 
     order.expire_at = time.time() + ORDER_TTL_SECONDS
-    await message.reply("Ордер продлён ✅ ещё на 30 минут.")
+    await message.reply("Ордер продлён ✅ ещё на 30 минут.", link_preview_options=NO_PREVIEW)
 
 
 @dp.message(F.text.regexp(CHECK_RE.pattern, flags=re.IGNORECASE))
@@ -301,7 +307,7 @@ async def check_orders(message: Message):
     active = [o for o in chat_orders.values() if o.expire_at > now]
 
     if not active:
-        await message.reply("Активных ордеров нет.")
+        await message.reply("Активных ордеров нет.", link_preview_options=NO_PREVIEW)
         return
 
     active.sort(key=lambda o: o.created_at)
@@ -324,7 +330,7 @@ async def check_orders(message: Message):
 
     sent = await message.answer(
         "\n".join(lines),
-        link_preview_options=LinkPreviewOptions(is_disabled=True)
+        link_preview_options=NO_PREVIEW
     )
 
     chat_snapshots = check_snapshots.setdefault(chat_id, OrderedDict())
@@ -341,7 +347,8 @@ async def take_order(message: Message):
 
     if message.reply_to_message is None:
         await message.reply(
-            "Команду /take нужно отправлять в ответ на сообщение со списком ордеров (/check)."
+            "Команду /take нужно отправлять в ответ на сообщение со списком ордеров (/check).",
+            link_preview_options=NO_PREVIEW
         )
         return
 
@@ -352,25 +359,26 @@ async def take_order(message: Message):
     if snapshot is None:
         await message.reply(
             "Это не то сообщение со списком ордеров, или список устарел. "
-            "Сделай новый /check и отвечай /take уже на него."
+            "Сделай новый /check и отвечай /take уже на него.",
+            link_preview_options=NO_PREVIEW
         )
         return
 
     number = int(match.group(2))
     if number < 1 or number > len(snapshot):
-        await message.reply(f"Нет ордера под номером {number} в этом списке.")
+        await message.reply(f"Нет ордера под номером {number} в этом списке.", link_preview_options=NO_PREVIEW)
         return
 
     order_id = snapshot[number - 1]
     order = orders.get(chat_id, {}).get(order_id)
 
     if order is None or order.expire_at <= time.time():
-        await message.reply("Этот ордер уже неактуален (взят или истёк).")
+        await message.reply("Этот ордер уже неактуален (взят или истёк).", link_preview_options=NO_PREVIEW)
         return
 
     taker = message.from_user
     if taker.id == order.user_id:
-        await message.reply("Нельзя взять свой же ордер 🙂")
+        await message.reply("Нельзя взять свой же ордер 🙂", link_preview_options=NO_PREVIEW)
         return
 
     # удаляем ордер из списка сразу, чтобы его не взяли повторно
@@ -384,7 +392,8 @@ async def take_order(message: Message):
     await message.reply(
         f"{creator_mention} ваш ордер взял {taker_mention}\n"
         "Внимание, проводите сделку через проверенных гарантов чата!\n"
-        "Будьте аккуратнее и удачи вам!"
+        "Будьте аккуратнее и удачи вам!",
+        link_preview_options=NO_PREVIEW
     )
 
 
@@ -406,15 +415,15 @@ def build_course_lines(data: dict) -> list[str] | None:
 async def show_course(message: Message):
     data = await fetch_rates()
     if not data:
-        await message.reply("Не получилось получить курс, попробуй чуть позже.")
+        await message.reply("Не получилось получить курс, попробуй чуть позже.", link_preview_options=NO_PREVIEW)
         return
 
     lines = build_course_lines(data)
     if lines is None:
-        await message.reply("Не получилось получить курс, попробуй чуть позже.")
+        await message.reply("Не получилось получить курс, попробуй чуть позже.", link_preview_options=NO_PREVIEW)
         return
 
-    await message.reply("\n".join(lines))
+    await message.reply("\n".join(lines), link_preview_options=NO_PREVIEW)
 
 
 # =========================
@@ -451,7 +460,7 @@ async def hourly_course_task(bot: Bot):
         text = "\n".join(lines)
         for chat_id in list(known_chats):
             try:
-                await bot.send_message(chat_id, text)
+                await bot.send_message(chat_id, text, link_preview_options=NO_PREVIEW)
             except Exception as e:
                 logger.warning(f"Не удалось отправить курс в чат {chat_id}: {e}")
 
