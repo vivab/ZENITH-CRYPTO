@@ -27,51 +27,57 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("order_bot")
 
 # Ключевые слова, по которым определяем тип ордера.
-# Порядок появления в тексте решает, если вдруг встретились слова из обеих групп.
 BUY_KEYWORDS = ["хавну", "возьму", "нужны", "нужен", "нужна", "дайте", "продайте", "куплю"]
 SELL_KEYWORDS = ["продам", "дам", "отдам"]
 
 BUY_EMOJI_FALLBACK = "🟩"
 SELL_EMOJI_FALLBACK = "🟥"
 
-# Кастомные премиум-эмодзи (id получены через debug-хендлер, см. ниже в файле)
+# Кастомные премиум-эмодзи
 BUY_CUSTOM_EMOJI_ID = "5296596700704548349"
 SELL_CUSTOM_EMOJI_ID = "5294049355601292129"
 
+GREEN_T_EMOJI_ID = "5406841020769936275"
+CLOCK_EMOJI_ID = "5197402116016072864"
+YELLOW_CIRCLE_EMOJI_ID = "5461117441612462242"
+GLASSES_CIRCLE_EMOJI_ID = "5368562433981947135"
+DOLLAR_EMOJI_ID = "5409048419211682843"
+RUBLE_EMOJI_ID = "5231449120635370684"
+
 
 def custom_emoji_html(emoji_id: str, fallback: str) -> str:
-    """
-    <tg-emoji> — официальный способ вставить кастомный (в т.ч. премиум) эмодзи
-    в текст сообщения при parse_mode=HTML. fallback показывается там,
-    где кастомные эмодзи не поддерживаются (старые клиенты и т.п.)
-    """
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
 
 BUY_EMOJI = custom_emoji_html(BUY_CUSTOM_EMOJI_ID, BUY_EMOJI_FALLBACK)
 SELL_EMOJI = custom_emoji_html(SELL_CUSTOM_EMOJI_ID, SELL_EMOJI_FALLBACK)
 
+GREEN_T = custom_emoji_html(GREEN_T_EMOJI_ID, "🟢")
+CLOCK = custom_emoji_html(CLOCK_EMOJI_ID, "⌚")
+YELLOW_CIRCLE = custom_emoji_html(YELLOW_CIRCLE_EMOJI_ID, "🟡")
+GLASSES_CIRCLE = custom_emoji_html(GLASSES_CIRCLE_EMOJI_ID, "😎")
+DOLLAR = custom_emoji_html(DOLLAR_EMOJI_ID, "$")
+RUBLE = custom_emoji_html(RUBLE_EMOJI_ID, "₽")
+
 # =========================
 #      КУРСЫ ВАЛЮТ (/course)
 # =========================
 
-# (id в CoinGecko, как показываем в сообщении)
-# Можно добавить/убрать монеты — id берутся с coingecko.com (в адресной строке монеты)
 COURSE_ASSETS = [
     ("tether", "$"),
     ("the-open-network", "TON (Gram)"),
 ]
 
-COURSE_CACHE_TTL_SECONDS = 60  # чтобы не долбить CoinGecko при частых /course
+COURSE_CACHE_TTL_SECONDS = 60
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 http_session: aiohttp.ClientSession | None = None
 _course_cache: dict = {"data": None, "fetched_at": 0.0}
 
 HOURLY_COURSE_INTERVAL_SECONDS = 60 * 60
+COMMANDS_INTERVAL_SECONDS = 12 * 60 * 60  # каждые 12 часов
 known_chats: set[int] = set()
 
-# Глобально отключаем предпросмотр ссылок
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
@@ -124,17 +130,9 @@ class Order:
     expire_at: float
 
 
-# chat_id -> {order_id: Order}
 orders: dict[int, dict[int, Order]] = {}
-
-# chat_id -> следующий свободный order_id
 order_counters: dict[int, int] = {}
-
-# chat_id -> {user_id: order_id}  (у каждого юзера максимум один активный ордер)
 user_current_order: dict[int, dict[int, int]] = {}
-
-# chat_id -> OrderedDict[check_message_id: [order_id, order_id, ...]]
-# нужен, чтобы /take N понимал, на какой именно /check отвечает пользователь
 check_snapshots: dict[int, "OrderedDict[int, list[int]]"] = {}
 
 
@@ -148,10 +146,10 @@ UP_RE = re.compile(r'^\.\s*up\s*$', re.IGNORECASE)
 CHECK_RE = re.compile(r'^/check(@\w+)?\s*$', re.IGNORECASE)
 TAKE_RE = re.compile(r'^/take(@\w+)?\s+(\d+)\s*$', re.IGNORECASE)
 COURSE_RE = re.compile(r'^/course(@\w+)?\s*$', re.IGNORECASE)
+COMMANDS_RE = re.compile(r'^/commands(@\w+)?\s*$', re.IGNORECASE)
 
 
 def detect_order_type(text: str) -> str | None:
-    """Возвращает 'buy' / 'sell' по самому раннему ключевому слову в тексте, либо None."""
     candidates: list[tuple[int, str]] = []
 
     for kw in BUY_KEYWORDS:
@@ -186,13 +184,31 @@ def user_label(user_id: int, username: str | None, display_name: str) -> str:
     return escape_html(display_name)
 
 
+def build_commands_message() -> str:
+    """Красивое сообщение с инструкциями (как на скриншоте)."""
+    return (
+        f"{GREEN_T} Привет это криптик! Ваш личный помощник поиска ордеров только в этом чате {GREEN_T}\n\n"
+        f"<b>Выставить ордер:</b>\n"
+        f"<code>/set Куплю $ на 10000₽</code>\n"
+        f"или\n"
+        f"<code>/set Продам $ на 10000₽</code>\n\n"
+        f"{CLOCK} Ордер действует 30 минут.\n\n"
+        f"Продлить: <code>.up</code>\n"
+        f"Удалить: <code>/-set</code>\n"
+        f"Посмотреть ордера: <code>/check</code>\n\n"
+        f"{YELLOW_CIRCLE} Нашли подходящий ордер? Ответьте на сообщение /check командой:\n"
+        f"<code>/take 1</code> — где 1 это номер ордера.\n\n"
+        f"🔄 Курс: <code>/course</code>\n\n"
+        f"{GLASSES_CIRCLE} После того как нашли контрагента, проводите сделку через проверенного гаранта чата.\n\n"
+        f"{RUBLE} Удачных сделок {DOLLAR}"
+    )
+
+
 dp = Dispatcher()
 
 
 @dp.message.outer_middleware()
 async def track_known_chats(handler, event: Message, data):
-    # запоминаем каждый чат, где бот увидел хоть одно сообщение —
-    # сюда потом будем присылать почасовой курс
     if event.chat.type in ("group", "supergroup"):
         known_chats.add(event.chat.id)
     return await handler(event, data)
@@ -205,15 +221,15 @@ async def track_known_chats(handler, event: Message, data):
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я доска ордеров для чата.\n\n"
-        "➕ <code>/set Куплю баксы на 700₽</code> — добавить ордер (актуален 30 минут).\n"
-        "🔄 <code>.up</code> — продлить свой ордер ещё на 30 минут.\n"
-        "➖ <code>/-set</code> — удалить свой ордер.\n\n"
-        "📋 <code>/check</code> — список всех актуальных ордеров.\n"
-        "🤝 В ответ на сообщение со списком: <code>/take 1</code> — взять ордер под номером 1.\n\n"
-        "💱 <code>/course</code> — актуальный курс доллара и нескольких криптовалют к рублю.\n\n"
-        "У каждого может быть только один активный ордер одновременно — "
-        "новый <code>/set</code> заменяет предыдущий.",
+        build_commands_message(),
+        link_preview_options=NO_PREVIEW
+    )
+
+
+@dp.message(F.text.regexp(COMMANDS_RE.pattern, flags=re.IGNORECASE))
+async def cmd_commands(message: Message):
+    await message.answer(
+        build_commands_message(),
         link_preview_options=NO_PREVIEW
     )
 
@@ -241,7 +257,6 @@ async def set_order(message: Message):
     user = message.from_user
     now = time.time()
 
-    # убираем предыдущий активный ордер этого же пользователя, если был
     existing_id = user_current_order.get(chat_id, {}).get(user.id)
     if existing_id is not None:
         orders.get(chat_id, {}).pop(existing_id, None)
@@ -324,7 +339,7 @@ async def check_orders(message: Message):
         emoji = BUY_EMOJI if order.order_type == "buy" else SELL_EMOJI
         label = user_label(order.user_id, order.username, order.display_name)
         if i > 1:
-            lines.append("")  # пустая строка-отступ между ордерами
+            lines.append("")
         lines.append(f"{i}. {emoji} {label} - {escape_html(order.raw_text)}")
         snapshot_ids.append(order.order_id)
 
@@ -381,7 +396,6 @@ async def take_order(message: Message):
         await message.reply("Нельзя взять свой же ордер 🙂", link_preview_options=NO_PREVIEW)
         return
 
-    # удаляем ордер из списка сразу, чтобы его не взяли повторно
     orders.get(chat_id, {}).pop(order_id, None)
     if user_current_order.get(chat_id, {}).get(order.user_id) == order_id:
         del user_current_order[chat_id][order.user_id]
@@ -465,6 +479,19 @@ async def hourly_course_task(bot: Bot):
                 logger.warning(f"Не удалось отправить курс в чат {chat_id}: {e}")
 
 
+async def commands_broadcast_task(bot: Bot):
+    """Каждые 12 часов отправляет инструкцию во все известные чаты."""
+    while True:
+        await asyncio.sleep(COMMANDS_INTERVAL_SECONDS)
+
+        text = build_commands_message()
+        for chat_id in list(known_chats):
+            try:
+                await bot.send_message(chat_id, text, link_preview_options=NO_PREVIEW)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить /commands в чат {chat_id}: {e}")
+
+
 # =========================
 #           MAIN
 # =========================
@@ -482,6 +509,7 @@ async def main():
     http_session = aiohttp.ClientSession()
     asyncio.create_task(cleanup_task())
     asyncio.create_task(hourly_course_task(bot))
+    asyncio.create_task(commands_broadcast_task(bot))
 
     logger.info("Бот запущен, слушаю сообщения...")
     try:
