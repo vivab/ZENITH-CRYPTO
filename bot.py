@@ -41,8 +41,10 @@ GREEN_T_EMOJI_ID = "5406841020769936275"
 CLOCK_EMOJI_ID = "5197402116016072864"
 YELLOW_CIRCLE_EMOJI_ID = "5461117441612462242"
 GLASSES_CIRCLE_EMOJI_ID = "5368562433981947135"
-DOLLAR_EMOJI_ID = "5409048419211682843"
-RUBLE_EMOJI_ID = "5231449120635370684"
+
+# Доллар и рубль теперь используют один и тот же кастомный эмодзи
+DOLLAR_EMOJI_ID = "5296597065776769217"
+RUBLE_EMOJI_ID = "5296597065776769217"
 
 
 def custom_emoji_html(emoji_id: str, fallback: str) -> str:
@@ -56,8 +58,10 @@ GREEN_T = custom_emoji_html(GREEN_T_EMOJI_ID, "🟢")
 CLOCK = custom_emoji_html(CLOCK_EMOJI_ID, "⌚")
 YELLOW_CIRCLE = custom_emoji_html(YELLOW_CIRCLE_EMOJI_ID, "🟡")
 GLASSES_CIRCLE = custom_emoji_html(GLASSES_CIRCLE_EMOJI_ID, "😎")
-DOLLAR = custom_emoji_html(DOLLAR_EMOJI_ID, "$")
-RUBLE = custom_emoji_html(RUBLE_EMOJI_ID, "₽")
+# Фолбэк должен быть настоящим эмодзи (не "$" / "₽"), иначе Telegram
+# вернёт ошибку ENTITY_TEXT_INVALID
+DOLLAR = custom_emoji_html(DOLLAR_EMOJI_ID, "💲")
+RUBLE = custom_emoji_html(RUBLE_EMOJI_ID, "💰")
 
 # =========================
 #      КУРСЫ ВАЛЮТ (/course)
